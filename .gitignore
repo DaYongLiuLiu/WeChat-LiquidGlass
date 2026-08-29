@@ -4,3 +4,4 @@ tools
 *.apk
 *.idsig
 *.keystore
+*.jks

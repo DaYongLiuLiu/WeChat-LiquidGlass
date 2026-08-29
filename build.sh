@@ -75,16 +75,28 @@ echo "[5/7] zipalign"
 "$BT/zipalign" -f -p 4 "$OUT/unsigned.apk" "$OUT/aligned.apk"
 
 echo "[6/7] sign"
-KS="$PROJ/debug.keystore"
-if [ ! -f "$KS" ]; then
-    keytool -genkeypair -keystore "$KS" -storepass android -keypass android \
-        -alias androiddebugkey -keyalg RSA -validity 10000 \
-        -dname 'CN=Android Debug,O=Android,C=US'
+# Release signing is passed in, never stored here: this file is public.
+#   KEYSTORE=path KEYSTORE_PASS=... [KEY_ALIAS=...] [KEY_PASS=...] ./build.sh
+# With nothing set it falls back to a throwaway debug key, which is fine for
+# sideloading but produces a different signature on every machine.
+KS="${KEYSTORE:-$PROJ/debug.keystore}"
+if [ -n "${KEYSTORE:-}" ]; then
+    [ -f "$KS" ] || { echo "keystore not found: $KS" >&2; exit 1; }
+    KS_PASS="${KEYSTORE_PASS:?KEYSTORE_PASS is required with KEYSTORE}"
+    KEY_PASS="${KEY_PASS:-$KS_PASS}"
+    SIGN_ARGS=(--ks "$KS" --ks-pass "pass:$KS_PASS" --key-pass "pass:$KEY_PASS")
+    [ -n "${KEY_ALIAS:-}" ] && SIGN_ARGS+=(--ks-key-alias "$KEY_ALIAS")
+else
+    if [ ! -f "$KS" ]; then
+        keytool -genkeypair -keystore "$KS" -storepass android -keypass android \
+            -alias androiddebugkey -keyalg RSA -validity 10000 \
+            -dname 'CN=Android Debug,O=Android,C=US'
+    fi
+    SIGN_ARGS=(--ks "$KS" --ks-pass pass:android --key-pass pass:android)
 fi
 FINAL="$PROJ/WeChatLiquidGlass-v$VERSION.apk"
 java -cp "$BT/lib/apksigner.jar" com.android.apksigner.ApkSignerTool sign \
-    --ks "$KS" --ks-pass pass:android --key-pass pass:android \
-    --out "$FINAL" "$OUT/aligned.apk"
+    "${SIGN_ARGS[@]}" --out "$FINAL" "$OUT/aligned.apk"
 
 echo "[7/7] verify"
 java -cp "$BT/lib/apksigner.jar" com.android.apksigner.ApkSignerTool verify \
