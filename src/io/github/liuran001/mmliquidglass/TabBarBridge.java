@@ -63,7 +63,156 @@ final class TabBarBridge {
         return v != null && TAB_VIEW_CLASS.equals(v.getClass().getName());
     }
 
-    /** Depth-first search for WeChat's tab bar under {@code root}. */
+    /** Tabs a bottom bar can plausibly have. */
+    private static final int MIN_TABS = 3;
+    private static final int MAX_TABS = 5;
+    /** A tab has to be tall enough to stack an icon over a label. */
+    private static final float MIN_TAB_HEIGHT_DP = 32f;
+
+    /**
+     * Locates the tab bar, by class name first and by shape only as a fallback.
+     *
+     * <p>The name is what actually holds today, and it is exact. The structural
+     * pass exists for the day WeChat renames the class: it is deliberately
+     * strict rather than best-effort, because the two failure modes are not
+     * comparable. Finding nothing leaves WeChat with its own bar and costs the
+     * user a feature; latching onto the wrong row would reparent some unrelated
+     * control into a floating pill and break the app.
+     */
+    static ViewGroup locateTabView(View root) {
+        ViewGroup byName = findTabView(root);
+        if (byName != null) {
+            return byName;
+        }
+        ViewGroup row = findTabRowByShape(root);
+        if (row == null) {
+            return null;
+        }
+        ViewGroup host = tightestWrapper(row);
+        WeChatLiquidGlassModule.log(android.util.Log.WARN,
+                "tab bar class not found; matched by shape instead: "
+                        + host.getClass().getName()
+                        + " tabs=" + row.getChildCount());
+        return host;
+    }
+
+    /**
+     * Whether this group is laid out the way a bottom tab row is.
+     *
+     * <p>Every one of these has to hold. The geometry alone would still admit a
+     * toolbar or a row of action buttons, so it is the last test that decides:
+     * either the children carry their own index as a tag, or exactly one of them
+     * is selected. Ordinary button rows do neither.
+     */
+    private static boolean looksLikeTabRow(View v) {
+        if (!(v instanceof ViewGroup) || v.getVisibility() != View.VISIBLE
+                || v.getWidth() <= 0 || v.getHeight() <= 0) {
+            return false;
+        }
+        ViewGroup g = (ViewGroup) v;
+        View first = null;
+        int prevRight = Integer.MIN_VALUE;
+        int tabs = 0;
+        int selected = 0;
+        boolean indexTagged = true;
+        for (int i = 0; i < g.getChildCount(); i++) {
+            View c = g.getChildAt(i);
+            if (c.getVisibility() != View.VISIBLE) {
+                continue;
+            }
+            if (first == null) {
+                first = c;
+            } else if (Math.abs(c.getWidth() - first.getWidth()) > 2) {
+                return false; // tabs share one width
+            }
+            if (c.getLeft() < prevRight) {
+                return false; // side by side, in order, not overlapping
+            }
+            prevRight = c.getRight();
+            Object tag = c.getTag();
+            if (!(tag instanceof Integer) || (Integer) tag != i) {
+                indexTagged = false;
+            }
+            if (c.isSelected()) {
+                selected++;
+            }
+            tabs++;
+        }
+        if (first == null || tabs < MIN_TABS || tabs > MAX_TABS) {
+            return false;
+        }
+        View root = v.getRootView();
+        if (root == null || root.getWidth() <= 0 || root.getHeight() <= 0) {
+            return false;
+        }
+        if (v.getWidth() < root.getWidth() * 0.6f) {
+            return false; // a tab bar spans most of the screen
+        }
+        float density = v.getResources().getDisplayMetrics().density;
+        if (first.getHeight() < MIN_TAB_HEIGHT_DP * density) {
+            return false;
+        }
+        int[] loc = new int[2];
+        int[] rootLoc = new int[2];
+        v.getLocationOnScreen(loc);
+        root.getLocationOnScreen(rootLoc);
+        float fromBottom = (rootLoc[1] + root.getHeight()) - (loc[1] + v.getHeight());
+        if (fromBottom > root.getHeight() * 0.25f) {
+            return false; // and sits at the bottom of it
+        }
+        return indexTagged || selected == 1;
+    }
+
+    /** Lowest group on screen that passes {@link #looksLikeTabRow}. */
+    private static ViewGroup findTabRowByShape(View root) {
+        if (root == null || root.getVisibility() != View.VISIBLE) {
+            return null;
+        }
+        if (root instanceof LiquidGlassHostLayout) {
+            return null; // our own bar, already installed
+        }
+        ViewGroup best = looksLikeTabRow(root) ? (ViewGroup) root : null;
+        if (root instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) root;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                ViewGroup found = findTabRowByShape(g.getChildAt(i));
+                if (found != null && (best == null || lowerOnScreen(found, best))) {
+                    best = found;
+                }
+            }
+        }
+        return best;
+    }
+
+    private static boolean lowerOnScreen(View a, View b) {
+        int[] la = new int[2];
+        int[] lb = new int[2];
+        a.getLocationOnScreen(la);
+        b.getLocationOnScreen(lb);
+        return la[1] + a.getHeight() > lb[1] + b.getHeight();
+    }
+
+    /**
+     * The smallest container that wraps the row, which is what gets reparented.
+     *
+     * <p>Stops as soon as an ancestor is taller than the row by any real margin:
+     * past that it is a page, not the bar.
+     */
+    private static ViewGroup tightestWrapper(ViewGroup row) {
+        ViewGroup best = row;
+        android.view.ViewParent p = row.getParent();
+        while (p instanceof ViewGroup && !(p instanceof LiquidGlassHostLayout)) {
+            ViewGroup g = (ViewGroup) p;
+            if (g.getHeight() > row.getHeight() * 1.6f) {
+                break;
+            }
+            best = g;
+            p = g.getParent();
+        }
+        return best;
+    }
+
+    /** Depth-first search for WeChat's tab bar under {@code root}, by class name. */
     static ViewGroup findTabView(View root) {
         if (isTabView(root)) {
             return root instanceof ViewGroup ? (ViewGroup) root : null;
@@ -97,7 +246,9 @@ final class TabBarBridge {
                 return (ViewGroup) c;
             }
         }
-        return null;
+        // Shape-matched bars can have no wrapper at all, in which case the view
+        // handed in is already the row.
+        return looksLikeTabRow(tabView) ? tabView : null;
     }
 
     /**

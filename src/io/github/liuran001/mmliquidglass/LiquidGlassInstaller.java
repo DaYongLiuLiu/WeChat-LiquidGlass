@@ -130,7 +130,7 @@ final class LiquidGlassInstaller {
             if (live != null) {
                 resetState();
             }
-            ViewGroup tabView = TabBarBridge.findTabView(decor);
+            ViewGroup tabView = TabBarBridge.locateTabView(decor);
             if (tabView == null) {
                 if (attempt < MAX_ATTEMPTS) {
                     decor.postDelayed(
