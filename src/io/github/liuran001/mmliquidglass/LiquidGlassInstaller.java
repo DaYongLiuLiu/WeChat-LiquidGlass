@@ -308,11 +308,9 @@ final class LiquidGlassInstaller {
         // no matter what its LayoutParams say. Drop it and let the scrollers
         // carry the inset instead.
         if (pg.getPaddingBottom() > 0) {
-            int pad = pg.getPaddingBottom();
             pg.setClipToPadding(false);
             pg.setPadding(pg.getPaddingLeft(), pg.getPaddingTop(),
                     pg.getPaddingRight(), 0);
-            padScrollersBottom(pg, pad, 0);
         }
         for (int i = 0; i < pg.getChildCount(); i++) {
             View c = pg.getChildAt(i);
@@ -333,6 +331,36 @@ final class LiquidGlassInstaller {
                 }
             });
         }
+        padScrollersBottom(pg, bottomReserve(pg), 0);
+    }
+
+    /** Breathing room between the last row and the pill once it is scrolled clear. */
+    private static final float LAST_ROW_GAP_DP = 8f;
+
+    /**
+     * Room the floating bar takes up at the bottom of the screen.
+     *
+     * <p>Measured off the pill rather than assembled from the constants that
+     * position it, so it stays right whatever the bar height, the float offset
+     * or the navigation inset turn out to be.
+     */
+    private static int bottomReserve(View anchor) {
+        LiquidGlassHostLayout host = sHostRef.get();
+        if (host == null || host.getHeight() <= 0) {
+            return 0;
+        }
+        host.getLocationOnScreen(sLoc);
+        // Undo the offset followBarOffset applies while the bar slides away.
+        float pillTop = sLoc[1] - host.getTranslationY() + host.getPaddingTop();
+        View root = host.getRootView();
+        if (root == null || root.getHeight() <= 0) {
+            return 0;
+        }
+        root.getLocationOnScreen(sLoc);
+        float density = anchor.getResources().getDisplayMetrics().density;
+        float reserve = (sLoc[1] + root.getHeight()) - pillTop
+                + LAST_ROW_GAP_DP * density;
+        return reserve > 0f ? Math.round(reserve) : 0;
     }
 
     private static void stretchToBottom(View c, int pageHeight) {
@@ -360,9 +388,6 @@ final class LiquidGlassInstaller {
         if (changed) {
             c.setLayoutParams(mlp);
         }
-        if (c instanceof ViewGroup) {
-            padScrollersBottom((ViewGroup) c, gap, 0);
-        }
     }
 
     /**
@@ -378,12 +403,16 @@ final class LiquidGlassInstaller {
             View c = root.getChildAt(i);
             if (isScroller(c)) {
                 ViewGroup sv = (ViewGroup) c;
-                if (sv.getPaddingBottom() >= pad) {
-                    continue; // already padded
+                // clipToPadding is re-asserted even when the amount already
+                // matches: WeChat turns it back on, and with it on the padded
+                // band goes blank instead of showing rows through the glass.
+                if (sv.getClipToPadding()) {
+                    sv.setClipToPadding(false);
                 }
-                sv.setClipToPadding(false);
-                sv.setPadding(sv.getPaddingLeft(), sv.getPaddingTop(),
-                        sv.getPaddingRight(), pad);
+                if (sv.getPaddingBottom() != pad) {
+                    sv.setPadding(sv.getPaddingLeft(), sv.getPaddingTop(),
+                            sv.getPaddingRight(), pad);
+                }
             } else if (c instanceof ViewGroup) {
                 padScrollersBottom((ViewGroup) c, pad, depth + 1);
             }
