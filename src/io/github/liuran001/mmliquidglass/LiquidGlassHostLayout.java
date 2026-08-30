@@ -137,31 +137,82 @@ final class LiquidGlassHostLayout extends FrameLayout {
     }
 
     private DragHandler mDragHandler;
+    private final int mTouchSlop;
+    private float mGestureDownX;
+    private float mGestureDownY;
+    private boolean mAncestorsBlocked;
 
     void setDragHandler(DragHandler handler) {
         mDragHandler = handler;
     }
 
+    /**
+     * Keeps an outer drawer or pager from claiming a drag that began on the
+     * floating bar.
+     *
+     * <p>Call the parent directly instead of {@link #requestDisallowInterceptTouchEvent}:
+     * setting the flag on this ViewGroup as well would prevent our own
+     * {@link #onInterceptTouchEvent} from seeing the MOVE that starts a droplet
+     * drag. Taps still go to the app's tab children. Horizontal movement stays
+     * protected for the droplet, while a clearly vertical gesture is released
+     * after QQ's own tab widget has had enough travel to fire its native
+     * swipe-up callback.
+     */
+    private void protectGestureFromAncestors(android.view.MotionEvent ev) {
+        int action = ev.getActionMasked();
+        android.view.ViewParent parent = getParent();
+        if (parent == null) {
+            return;
+        }
+        if (action == android.view.MotionEvent.ACTION_DOWN) {
+            mGestureDownX = ev.getX();
+            mGestureDownY = ev.getY();
+            mAncestorsBlocked = true;
+            parent.requestDisallowInterceptTouchEvent(true);
+            return;
+        }
+        if (action == android.view.MotionEvent.ACTION_MOVE && mAncestorsBlocked) {
+            float dx = ev.getX() - mGestureDownX;
+            float dy = ev.getY() - mGestureDownY;
+            // QQTabWidget's native upward action fires after 50 px. Releasing
+            // before that would let the outer drawer cancel the child first.
+            float verticalRelease = Math.max(mTouchSlop, 50f);
+            if (Math.abs(dy) > verticalRelease && Math.abs(dy) > Math.abs(dx)) {
+                mAncestorsBlocked = false;
+                parent.requestDisallowInterceptTouchEvent(false);
+            }
+            return;
+        }
+        if ((action == android.view.MotionEvent.ACTION_UP
+                || action == android.view.MotionEvent.ACTION_CANCEL)
+                && mAncestorsBlocked) {
+            mAncestorsBlocked = false;
+            parent.requestDisallowInterceptTouchEvent(false);
+        }
+    }
+
     @Override
     public boolean onInterceptTouchEvent(android.view.MotionEvent ev) {
+        protectGestureFromAncestors(ev);
         try {
             if (mDragHandler != null && mDragHandler.onIntercept(ev)) {
                 return true;
             }
         } catch (Throwable t) {
-            WeChatLiquidGlassModule.logErr("drag intercept failed", t);
+            LiquidGlassModule.logErr("drag intercept failed", t);
         }
         return super.onInterceptTouchEvent(ev);
     }
 
     @Override
     public boolean onTouchEvent(android.view.MotionEvent ev) {
+        protectGestureFromAncestors(ev);
         try {
             if (mDragHandler != null && mDragHandler.onTouch(ev)) {
                 return true;
             }
         } catch (Throwable t) {
-            WeChatLiquidGlassModule.logErr("drag touch failed", t);
+            LiquidGlassModule.logErr("drag touch failed", t);
         }
         return super.onTouchEvent(ev);
     }
@@ -180,29 +231,62 @@ final class LiquidGlassHostLayout extends FrameLayout {
     private int mShadowClipW = -1;
     private int mShadowClipH = -1;
 
+    /** The app's own bar, kept so the theme can be re-read off its labels. */
+    private ViewGroup mBar;
+
     LiquidGlassHostLayout(Context context, ViewGroup sampleRoot, ViewGroup bar) {
         super(context);
         mSampleRoot = sampleRoot;
+        mBar = bar;
+        mTouchSlop = android.view.ViewConfiguration.get(context).getScaledTouchSlop();
         mDensity = context.getResources().getDisplayMetrics().density;
-        // WeChat resolves day/night through standard values-night qualifiers,
-        // so the activity uiMode is the authoritative source. The text probe
-        // below only serves as a cross-check in the log.
         Boolean detected = detectDarkFromText(bar);
-        mDarkMode = isSystemNight(context);
+        mDarkMode = resolveDark(context, detected);
         mUseAgsl = Build.VERSION.SDK_INT >= 33;
         setTag(GLASS_TAG);
         setWillNotDraw(false);
         setupPaints();
-        WeChatLiquidGlassModule.log(android.util.Log.INFO,
+        LiquidGlassModule.log(android.util.Log.INFO,
                 "host created: sdk=" + Build.VERSION.SDK_INT
                         + " path=" + (mUseAgsl ? "agsl" : "legacy-frost")
-                        + " dark=" + mDarkMode + " source="
-                        + (detected != null ? "text-color" : "uiMode"));
+                        + " dark=" + mDarkMode + " source=" + darkSource(detected)
+                        + " uiMode=" + isSystemNight(context)
+                        + " textProbe=" + detected);
+    }
+
+    /**
+     * Light or dark, from whichever signal the host app actually honours.
+     *
+     * <p>WeChat's uiMode is the whole story — it resolves day/night through
+     * standard {@code values-night} qualifiers — so the label probe there is
+     * logged and nothing more. QQ's skin engine has a night mode independent of
+     * the system's, and the labels are the only thing that reflects it, so the
+     * probe leads and uiMode is the fallback for when it finds no labels.
+     */
+    private static boolean resolveDark(Context context, Boolean textProbe) {
+        HostApp app = LiquidGlassModule.app();
+        if (app != null && app.preferTextColorProbe && textProbe != null) {
+            return textProbe;
+        }
+        return isSystemNight(context);
+    }
+
+    private static String darkSource(Boolean textProbe) {
+        HostApp app = LiquidGlassModule.app();
+        return app != null && app.preferTextColorProbe && textProbe != null
+                ? "text-color" : "uiMode";
     }
 
     /** Activates the vendored QmDeve renderer; disables internal frost drawing. */
     void setGlassTuner(GlassTuner tuner) {
         mTuner = tuner;
+        if (tuner != null) {
+            // QQ can use a skin whose light/dark state differs from uiMode.
+            // The host has already resolved that from the live tab labels, so
+            // initialise the renderer from the same source immediately rather
+            // than waiting for a future theme transition that may never occur.
+            tuner.onTheme(mDarkMode);
+        }
     }
 
     @SuppressWarnings("unused")
@@ -389,7 +473,7 @@ final class LiquidGlassHostLayout extends FrameLayout {
             }
             invalidate();
         } catch (Throwable t) {
-            WeChatLiquidGlassModule.logErr("capture failed", t);
+            LiquidGlassModule.logErr("capture failed", t);
         } finally {
             mCapturing = false;
         }
@@ -413,17 +497,21 @@ final class LiquidGlassHostLayout extends FrameLayout {
         }
     }
 
-    /** Re-evaluates dark/light periodically so theme switches follow the app live.
-     *  Uses the activity uiMode: WeChat resolves day/night via standard
-     *  values-night qualifiers, so this mirrors the app's real theme. */
+    /** Re-evaluates dark/light periodically so theme switches follow the app
+     *  live, through the same signal {@link #resolveDark} picked at install. */
     private void maybeRefreshTheme() {
         mCaptureCount++;
         if (mCaptureCount % 20 != 1) {
             return;
         }
-        boolean detected = isSystemNight(getContext());
+        // Only walk the labels for the apps that are decided by them; for the
+        // rest this stays the config read it always was.
+        HostApp app = LiquidGlassModule.app();
+        Boolean probe = app != null && app.preferTextColorProbe
+                ? detectDarkFromText(mBar) : null;
+        boolean detected = resolveDark(getContext(), probe);
         if (mCaptureCount == 1) {
-            WeChatLiquidGlassModule.log(android.util.Log.INFO,
+            LiquidGlassModule.log(android.util.Log.INFO,
                     "theme probe first sample: dark=" + detected
                             + " current=" + mDarkMode);
         }
@@ -434,7 +522,7 @@ final class LiquidGlassHostLayout extends FrameLayout {
             }
             setupPaints();
             invalidate();
-            WeChatLiquidGlassModule.log(android.util.Log.INFO,
+            LiquidGlassModule.log(android.util.Log.INFO,
                     "theme switched: dark=" + mDarkMode);
         }
     }

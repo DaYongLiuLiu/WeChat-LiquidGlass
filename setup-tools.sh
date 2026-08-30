@@ -22,10 +22,21 @@ fetch https://dl.google.com/android/repository/build-tools_r34-linux.zip bt34.zi
 fetch https://dl.google.com/android/repository/platform-34-ext7_r03.zip plat34.zip
 
 echo "[3/3] unpack"
-mkdir -p xapi bt plat
-(cd xapi && unzip -o -q ../api-102.aar)
-unzip -o -q bt34.zip -d bt
-unzip -o -q plat34.zip -d plat
+# Unpacked via python, for the same reason build.sh zips that way: NixOS ships
+# no unzip(1). The exec bit has to be carried over by hand — aapt2, d8 and
+# zipalign come out of the archive as plain files otherwise.
+python3 - <<'PYUNZIP'
+import os, zipfile
+for src, dst in (("api-102.aar", "xapi"), ("bt34.zip", "bt"), ("plat34.zip", "plat")):
+    os.makedirs(dst, exist_ok=True)
+    with zipfile.ZipFile(src) as z:
+        for info in z.infolist():
+            out = z.extract(info, dst)
+            mode = info.external_attr >> 16
+            if mode:
+                os.chmod(out, mode)
+    print(f"  unpacked {src} -> {dst}/")
+PYUNZIP
 chmod +x bt/*/aapt2 bt/*/d8 bt/*/zipalign 2>/dev/null || true
 
 echo "done. tools in $TOOL_ROOT"

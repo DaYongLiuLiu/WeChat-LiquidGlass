@@ -104,6 +104,8 @@ final class LiquidGlassPanel extends View {
     private final int mPad;
 
     private final RenderNode mNode = new RenderNode("wxLiquidGlass");
+    /** Separate display list used when the droplet reuses this blurred surface. */
+    private final RenderNode mEmbeddedNode = new RenderNode("wxLiquidGlassEmbedded");
     // Reused every frame: onDraw runs on each traversal, and allocating here
     // would churn the heap for nothing.
     private final int[] mSelf = new int[2];
@@ -182,7 +184,7 @@ final class LiquidGlassPanel extends View {
                 mHighlightShader = new RuntimeShader(HIGHLIGHT_SHADER);
             } catch (Throwable t) {
                 mSupported = false;
-                WeChatLiquidGlassModule.logErr("lens shader rejected", t);
+                LiquidGlassModule.logErr("lens shader rejected", t);
             }
         }
         setTheme(night);
@@ -239,12 +241,28 @@ final class LiquidGlassPanel extends View {
         }
         float radius = h * 0.5f;
 
+        drawPanel(canvas, w, h, radius, mNode,
+                ViewGeom.cumulativeScale(this));
+    }
+
+    /** Draws the resting pill material into the droplet's combined backdrop. */
+    void drawEmbedded(Canvas canvas) {
+        int w = getWidth();
+        int h = getHeight();
+        if (w <= 0 || h <= 0) {
+            return;
+        }
+        drawPanel(canvas, w, h, h * 0.5f, mEmbeddedNode, 1f);
+    }
+
+    private void drawPanel(Canvas canvas, int w, int h, float radius,
+                           RenderNode node, float captureScale) {
         if (mSupported && canvas.isHardwareAccelerated()) {
             try {
-                drawGlass(canvas, w, h, radius);
+                drawGlass(canvas, w, h, radius, node, captureScale);
             } catch (Throwable t) {
                 mSupported = false;
-                WeChatLiquidGlassModule.logErr("glass draw failed, flat fallback", t);
+                LiquidGlassModule.logErr("glass draw failed, flat fallback", t);
             }
         }
 
@@ -285,7 +303,8 @@ final class LiquidGlassPanel extends View {
         canvas.restoreToCount(save);
     }
 
-    private void drawGlass(Canvas canvas, int w, int h, float radius) {
+    private void drawGlass(Canvas canvas, int w, int h, float radius,
+                           RenderNode node, float captureScale) {
         ViewGroup pager = mBackdropRef.get();
         if (pager == null || pager.getWidth() <= 0) {
             return;
@@ -293,7 +312,7 @@ final class LiquidGlassPanel extends View {
 
         int nw = w + mPad * 2;
         int nh = h + mPad * 2;
-        mNode.setPosition(0, 0, nw, nh);
+        node.setPosition(0, 0, nw, nh);
 
         // Positions have to be scale-free: while dragging, the whole bar grows
         // (KernelSU's layerBlock), so getLocationOnScreen would report where this
@@ -304,14 +323,14 @@ final class LiquidGlassPanel extends View {
             getLocationOnScreen(self);
         }
 
-        RecordingCanvas rc = mNode.beginRecording(nw, nh);
+        RecordingCanvas rc = node.beginRecording(nw, nh);
         try {
             // Undo the scale this view is drawn at — its own and every ancestor's
             // — or the sampled backdrop comes out stretched instead of revealing
             // more of what sits behind.
-            float viewScale = ViewGeom.cumulativeScale(this);
-            if (Math.abs(viewScale - 1f) > 0.001f) {
-                rc.scale(1f / viewScale, 1f / viewScale, nw * 0.5f, nh * 0.5f);
+            if (Math.abs(captureScale - 1f) > 0.001f) {
+                rc.scale(1f / captureScale, 1f / captureScale,
+                        nw * 0.5f, nh * 0.5f);
             }
             // Lay down the page colour first. Any part of the node the pages do
             // not cover — which happens as soon as WeChat slides the bar past the
@@ -351,7 +370,7 @@ final class LiquidGlassPanel extends View {
                 pager.draw(rc);
             }
         } finally {
-            mNode.endRecording();
+            node.endRecording();
         }
 
         // Every uniform here is a function of the pill's size, so the whole
@@ -374,12 +393,12 @@ final class LiquidGlassPanel extends View {
             mChainW = w;
             mChainH = h;
         }
-        mNode.setRenderEffect(mChain);
+        node.setRenderEffect(mChain);
 
         canvas.save();
         canvas.clipPath(mClip);
         canvas.translate(-mPad, -mPad);
-        canvas.drawRenderNode(mNode);
+        canvas.drawRenderNode(node);
         canvas.restore();
     }
 }

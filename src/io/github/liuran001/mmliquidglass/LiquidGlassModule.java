@@ -9,25 +9,28 @@ import io.github.libxposed.api.XposedModuleInterface;
 
 import java.lang.reflect.Method;
 
-public class WeChatLiquidGlassModule extends XposedModule {
+public class LiquidGlassModule extends XposedModule {
 
-    static final String TAG = "WeChatLiquidGlass";
+    static final String TAG = "LiquidGlass";
 
-    static final String TARGET_PKG = "com.tencent.mm";
-    /** WeChat's home activity; hosts the bottom tab bar we replace. */
-    private static final String LAUNCHER_ACTIVITY = "com.tencent.mm.ui.LauncherUI";
+    /** The app this process belongs to; null until onModuleLoaded resolves it. */
+    private static volatile HostApp sApp;
 
     private static volatile int sResumeHits;
-    private static volatile WeChatLiquidGlassModule sSelf;
+    private static volatile LiquidGlassModule sSelf;
 
-    public WeChatLiquidGlassModule() {
+    public LiquidGlassModule() {
         super();
         sSelf = this;
     }
 
+    static HostApp app() {
+        return sApp;
+    }
+
     /** Hooks an executable, running fn AFTER the original and ignoring its result. */
     static void hookAfter(java.lang.reflect.Executable ex, AfterCallback fn) {
-        WeChatLiquidGlassModule self = sSelf;
+        LiquidGlassModule self = sSelf;
         if (self == null) {
             throw new IllegalStateException("module instance not attached yet");
         }
@@ -54,13 +57,16 @@ public class WeChatLiquidGlassModule extends XposedModule {
         log(android.util.Log.INFO, "onModuleLoaded process=" + proc
                 + " api=" + getApiVersion()
                 + " framework=" + getFrameworkName() + " " + getFrameworkVersion());
-        // WeChat is heavily multi-process (:push, :tools, :appbrandX, ...).
-        // LauncherUI lives in the main process only; everything else detaches.
-        if (!TARGET_PKG.equals(proc)) {
-            log(android.util.Log.INFO, "not the main process, detach");
+        // Both targets are heavily multi-process (:push, :tools, :MSF,
+        // :appbrandX, ...). The home screen lives in the main process only,
+        // whose name is the package name; everything else detaches.
+        HostApp app = HostApp.forProcess(proc);
+        if (app == null) {
+            log(android.util.Log.INFO, "not a main process we dress up, detach");
             detach();
             return;
         }
+        sApp = app;
         try {
             Method callOnResume = Instrumentation.class.getMethod(
                     "callActivityOnResume", Activity.class);
@@ -73,12 +79,12 @@ public class WeChatLiquidGlassModule extends XposedModule {
                             if (arg0 instanceof Activity) {
                                 Activity activity = (Activity) arg0;
                                 String name = arg0.getClass().getName();
-                                if (LAUNCHER_ACTIVITY.equals(name)) {
+                                if (app.launcherActivity.equals(name)) {
                                     GlassConfig.load(activity);
                                     sResumeHits++;
                                     if (sResumeHits <= 3 || sResumeHits % 20 == 0) {
                                         log(android.util.Log.INFO,
-                                                "LauncherUI onResume #" + sResumeHits);
+                                                "home activity onResume #" + sResumeHits);
                                     }
                                     LiquidGlassInstaller.scheduleInstall(activity);
                                 }
@@ -88,7 +94,8 @@ public class WeChatLiquidGlassModule extends XposedModule {
                         }
                         return result;
                     });
-            log(android.util.Log.INFO, "hooked Instrumentation.callActivityOnResume");
+            log(android.util.Log.INFO, "hooked Instrumentation.callActivityOnResume for "
+                    + app + " (" + app.launcherActivity + ")");
         } catch (Throwable t) {
             logErr("install resume hook failed", t);
         }
@@ -96,14 +103,16 @@ public class WeChatLiquidGlassModule extends XposedModule {
 
     @Override
     public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam param) {
-        if (!TARGET_PKG.equals(param.getPackageName()) || !param.isFirstPackage()) {
+        HostApp app = HostApp.forPackage(param.getPackageName());
+        if (app == null || !param.isFirstPackage()) {
             return;
         }
-        log(android.util.Log.INFO, "target package loaded, classLoader="
-                + param.getDefaultClassLoader());
-        // The tab bar bridge needs WeChat's own classes, so it can only be
+        sApp = app;
+        log(android.util.Log.INFO, "target package loaded: " + app
+                + " classLoader=" + param.getDefaultClassLoader());
+        // The tab bar bridge needs the app's own classes, so it can only be
         // wired once the app class loader exists.
-        TabBarBridge.install(param.getDefaultClassLoader());
+        TabBarBridge.install(app, param.getDefaultClassLoader());
     }
 
     static void log(int prio, String msg) {

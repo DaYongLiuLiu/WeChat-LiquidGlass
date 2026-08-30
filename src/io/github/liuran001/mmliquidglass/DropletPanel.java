@@ -2,12 +2,15 @@ package io.github.liuran001.mmliquidglass;
 
 import android.content.Context;
 import android.graphics.Canvas;
+import android.graphics.ColorMatrix;
+import android.graphics.ColorMatrixColorFilter;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.RecordingCanvas;
 import android.graphics.RenderEffect;
 import android.graphics.RenderNode;
 import android.graphics.RuntimeShader;
+import android.graphics.Shader;
 import android.os.Build;
 import android.view.View;
 import android.view.ViewGroup;
@@ -46,6 +49,11 @@ final class DropletPanel extends View {
     private static final float AMOUNT_DP = 14f;
     /** KernelSU: chromaticAberration = 0.5f. */
     private static final float ABERRATION = 0.5f;
+    /** Slightly wider than the previous ~15% rim, without reaching the centre. */
+    private static final float REFRACTION_FRACTION = 0.18f;
+    /** Keep the pressed backdrop on the same material as the resting pill. */
+    private static final float BACKDROP_BLUR_DP = 4f;
+    private static final float BACKDROP_SATURATION = 1.5f;
     /**
      * KernelSU: {@code LocalFloatingBottomBarTabScale = lerp(1f, 1.2f, progress)}.
      *
@@ -126,12 +134,15 @@ final class DropletPanel extends View {
             + "}\n";
 
     private final WeakReference<ViewGroup> mPagerRef;
-    private final WeakReference<ViewGroup> mTabRowRef;
+    private WeakReference<ViewGroup> mTabRowRef;
     private final float mDensity;
     private final int mPad;
-    private final boolean mNight;
+    private boolean mNight;
 
     private final RenderNode mNode = new RenderNode("wxDroplet");
+    /** Page-only layer, blurred before the clear tab copy is composited over it. */
+    private final RenderNode mBackdropNode = new RenderNode("wxDropletBackdrop");
+    private RenderEffect mBackdropEffect;
     private RuntimeShader mLens;
     private RuntimeShader mInnerShader;
 
@@ -231,6 +242,16 @@ final class DropletPanel extends View {
                 || tab.getWidth() <= 0 || tab.getHeight() <= 0) {
             return;
         }
+        if (tab.isSelected()) {
+            // The selected tab is already painted in the accent colour by the
+            // app itself, so the tint has nothing to add — and QQ's selected
+            // glyph is not one flat colour but a blue disc with a white mark
+            // cut into it, which a flat SRC_ATOP pass would collapse into a
+            // silhouette. Drawn as-is it keeps that detail, and its badge with
+            // it. The tint is for the tabs the droplet is sliding *towards*.
+            tab.draw(c);
+            return;
+        }
         int w = tab.getWidth();
         int h = tab.getHeight();
         // The bubble hangs off the icon's top-right and can reach past the tab's
@@ -248,6 +269,11 @@ final class DropletPanel extends View {
         // from its parent — so the tab is redrawn as a whole, clipped to the
         // badge's own capsule. Whoever actually paints those pixels, the
         // untinted copy is what survives inside the clip.
+        //
+        // What counts as a badge is "does this view draw at all", asked through
+        // willNotDraw(). Asking whether it has a background instead missed QQ's
+        // QUIBadge, which paints its bubble in onDraw and carries no background
+        // — so the red dot fell through to the tint and came out accent blue.
         if (tab instanceof ViewGroup) {
             mBadgeCount = 0;
             collectBadges((ViewGroup) tab, 0f, 0f, 0);
@@ -274,8 +300,8 @@ final class DropletPanel extends View {
      * right and would read as a green blob if it were tinted along with them.
      */
     private static boolean ownsItsColour(View v) {
-        String cls = v.getClass().getName();
-        if (cls.endsWith("TabIconView")) {
+        HostApp app = LiquidGlassModule.app();
+        if (app != null && app.isTabIconClass(v.getClass().getName())) {
             return false;
         }
         return !(v instanceof android.widget.TextView && v.getBackground() == null);
@@ -305,13 +331,15 @@ final class DropletPanel extends View {
                     || child.getWidth() <= 0 || child.getHeight() <= 0) {
                 continue;
             }
-            float cx = ox + child.getLeft();
-            float cy = oy + child.getTop();
+            // QQ's icon-only layout centres QUIBadge with translationY rather
+            // than relaying it out. The untinted repaint has to clip where the
+            // badge is actually drawn; using left/top alone leaves the lower
+            // half outside the clip, where the accent pass turns it blue.
+            float cx = ox + child.getLeft() + child.getTranslationX();
+            float cy = oy + child.getTop() + child.getTranslationY();
             if (child instanceof ViewGroup && ((ViewGroup) child).getChildCount() > 0) {
                 collectBadges((ViewGroup) child, cx, cy, depth + 1);
-            } else if (ownsItsColour(child)
-                    && (child.getBackground() != null
-                        || child instanceof android.widget.ImageView)) {
+            } else if (ownsItsColour(child) && !child.willNotDraw()) {
                 addBadge(cx, cy, cx + child.getWidth(), cy + child.getHeight());
             }
         }
@@ -327,7 +355,7 @@ final class DropletPanel extends View {
         if (tabRow == null || tabRow.getChildCount() == 0) {
             return 0f;
         }
-        View tab = tabRow.getChildAt(0);
+        View tab = TabBarBridge.tabAt(tabRow, 0);
         if (tab == null || tab.getHeight() <= 0) {
             return 0f;
         }
@@ -336,6 +364,14 @@ final class DropletPanel extends View {
             return centre;
         }
         View content = ((ViewGroup) tab).getChildAt(0);
+        // QQ's Material TabView exposes a full-column RelativeLayout here, not
+        // the tight icon+label stack WeChat exposes. Treating 0..tabHeight as
+        // content leaves no room for a rim and clamps the lens to almost zero.
+        if (content.getVisibility() != VISIBLE || content.getHeight() <= 0
+                || (content.getTop() <= 1
+                && content.getBottom() >= tab.getHeight() - 1)) {
+            return -1f;
+        }
         return Math.max(centre - content.getTop(),
                 content.getTop() + content.getHeight() - centre);
     }
@@ -349,7 +385,6 @@ final class DropletPanel extends View {
         mPagerRef = new WeakReference<>(pager);
         mTabRowRef = new WeakReference<>(tabRow);
         mDensity = density;
-        mNight = night;
         mPad = Math.round(AMOUNT_DP * density) + Math.round(density * 4f);
 
         mSupported = Build.VERSION.SDK_INT >= 33;
@@ -357,19 +392,41 @@ final class DropletPanel extends View {
             try {
                 mLens = new RuntimeShader(LENS_SHADER);
                 mInnerShader = new RuntimeShader(INNER_SHADOW_SHADER);
+                ColorMatrix saturation = new ColorMatrix();
+                saturation.setSaturation(BACKDROP_SATURATION);
+                RenderEffect saturate = RenderEffect.createColorFilterEffect(
+                        new ColorMatrixColorFilter(saturation));
+                float blur = BACKDROP_BLUR_DP * density;
+                mBackdropEffect = RenderEffect.createBlurEffect(
+                        blur, blur, saturate, Shader.TileMode.CLAMP);
             } catch (Throwable t) {
                 mSupported = false;
-                WeChatLiquidGlassModule.logErr("droplet shader rejected", t);
+                LiquidGlassModule.logErr("droplet shader rejected", t);
             }
         }
-        mPillSurface.setColor(night ? 0xE62C2C2E : 0xE6F2F2F7);
-        mWash.setColor(night ? 0x1AFFFFFF : 0x1A000000);
+        setTheme(night);
         mPressTint.setColor(0x08000000);
         mHighlight.setStyle(Paint.Style.STROKE);
         mHighlight.setStrokeWidth(density);
         mHighlight.setColor(0x1FFFFFFF);
         mInnerShadow.setStyle(Paint.Style.FILL);
         setWillNotDraw(false);
+    }
+
+    /** Updates the resting wash and lens fallback without stacking a background. */
+    void setTheme(boolean night) {
+        mNight = night;
+        // Same 40% surface-container wash used by LiquidGlassPanel. The old
+        // 90% fill hid nearly all of the blur as soon as the droplet appeared.
+        mPillSurface.setColor(night ? 0x662C2C2E : 0x66F2F2F7);
+        mWash.setColor(night ? 0x1AFFFFFF : 0x1A000000);
+        invalidate();
+    }
+
+    /** Rebinds the tab row when the host app rebuilds its dynamic bottom bar. */
+    void setTabRow(ViewGroup tabRow) {
+        mTabRowRef = new WeakReference<>(tabRow);
+        invalidate();
     }
 
     /** Press progress, 0..1, driven by the drag controller's spring. */
@@ -409,25 +466,24 @@ final class DropletPanel extends View {
         float radius = h * 0.5f;
         float p = mProgress;
 
+        boolean drewLens = false;
         if (mSupported && p > 0.01f && canvas.isHardwareAccelerated()) {
             try {
-                drawLens(canvas, w, h, radius, p);
+                drewLens = drawLens(canvas, w, h, radius, p);
             } catch (Throwable t) {
                 mSupported = false;
-                WeChatLiquidGlassModule.logErr("droplet lens failed", t);
+                LiquidGlassModule.logErr("droplet lens failed", t);
             }
         }
 
-        // KernelSU: the flat wash fades out exactly as the lens fades in.
-        int washAlpha = Math.round(0x1A * (1f - p));
-        if (washAlpha > 0) {
-            mWash.setAlpha(washAlpha);
-            canvas.drawRoundRect(0, 0, w, h, radius, radius, mWash);
+        // When the lens is active these surface tints are already inside its
+        // backdrop, below the clear tab copy. The fallback path keeps the same
+        // order by repainting the current tab after the tints.
+        if (!drewLens) {
+            drawSurfaceTints(canvas, 0f, 0f, w, h, radius, p);
+            drawRestingTab(canvas);
         }
         if (p > 0f) {
-            mPressTint.setAlpha(Math.round(0x08 * p));
-            canvas.drawRoundRect(0, 0, w, h, radius, radius, mPressTint);
-
             mHighlight.setAlpha(Math.round(0x1F * p));
             float half = mHighlight.getStrokeWidth() * 0.5f;
             canvas.drawRoundRect(half, half, w - half, h - half,
@@ -448,62 +504,150 @@ final class DropletPanel extends View {
         }
     }
 
+    /** Draws the resting wash and press tint below tab content. */
+    private void drawSurfaceTints(Canvas canvas, float left, float top,
+                                  float right, float bottom, float radius, float p) {
+        // A 10% black wash is noticeably heavier than the equivalent white wash,
+        // so the light capsule uses half the opacity.
+        int restingAlpha = mNight ? 0x1A : 0x0D;
+        int washAlpha = Math.round(restingAlpha * (1f - p));
+        if (washAlpha > 0) {
+            mWash.setAlpha(washAlpha);
+            canvas.drawRoundRect(left, top, right, bottom, radius, radius, mWash);
+        }
+        int pressAlpha = Math.round(0x08 * p);
+        if (pressAlpha > 0) {
+            mPressTint.setAlpha(pressAlpha);
+            canvas.drawRoundRect(left, top, right, bottom,
+                    radius, radius, mPressTint);
+        }
+    }
+
     /**
-     * Builds the shader's input layer: page content, the pill surface, and the
-     * scaled, tinted copy of the tabs.
+     * Repaints the selected tab above the resting capsule so the capsule changes
+     * only its background, not the app's selected icon/text colour.
      */
-    private void paintBackdrop(Canvas c, int nw, int nh, int[] self, float p) {
-        ViewGroup pager = mPagerRef.get();
+    private void drawRestingTab(Canvas canvas) {
         ViewGroup tabRow = mTabRowRef.get();
+        int index = TabBarBridge.selectedIndex(tabRow);
+        View tab = TabBarBridge.tabAt(tabRow, index);
+        if (tab == null || tab.getVisibility() != VISIBLE
+                || !ViewGeom.unscaledScreenPos(this, mSelf)
+                || !ViewGeom.unscaledScreenPos(tab, mSrc)) {
+            return;
+        }
+        int save = canvas.save();
+        canvas.translate(mSrc[0] - mSelf[0], mSrc[1] - mSelf[1]);
+        tab.draw(canvas);
+        canvas.restoreToCount(save);
+    }
+
+    /** Records the whole droplet-sized page capture before any tabs are added. */
+    private void recordBlurredBackdrop(int nw, int nh, int[] self) {
+        ViewGroup pager = mPagerRef.get();
         if (pager == null) {
             return;
         }
-        int[] src = mSrc;
-        c.drawColor(mNight ? 0xFF111111 : 0xFFF7F7F7);
-        // Undo the view's own scale before sampling. While held the droplet is
-        // blown up to 78/56, and that scale stretches whatever this node
-        // contains — so the backdrop came out magnified on top of the 1.2×
-        // tab copy. KernelSU's backdrop is sampled in fixed screen space:
-        // growing the droplet shows *more* of the background, it does not
-        // enlarge it. Pre-scaling by 1/s reproduces that.
-        float viewScale = ViewGeom.cumulativeScale(this);
-        if (Math.abs(viewScale - 1f) > 0.001f) {
-            c.scale(1f / viewScale, 1f / viewScale, nw * 0.5f, nh * 0.5f);
-        }
-        android.graphics.Rect visible = mVisible;
-        for (int i = 0; i < pager.getChildCount(); i++) {
-            View page = pager.getChildAt(i);
-            if (page.getVisibility() != VISIBLE
-                    || !page.getGlobalVisibleRect(visible) || visible.isEmpty()) {
-                continue;
+        mBackdropNode.setPosition(0, 0, nw, nh);
+        RecordingCanvas c = mBackdropNode.beginRecording(nw, nh);
+        try {
+            int[] src = mSrc;
+            c.drawColor(mNight ? 0xFF111111 : 0xFFF7F7F7);
+            android.graphics.Rect visible = mVisible;
+            boolean drewAny = false;
+            for (int i = 0; i < pager.getChildCount(); i++) {
+                View page = pager.getChildAt(i);
+                if (page.getVisibility() != VISIBLE
+                        || !page.getGlobalVisibleRect(visible) || visible.isEmpty()) {
+                    continue;
+                }
+                page.getLocationOnScreen(src);
+                int save = c.save();
+                c.translate(mPad - (self[0] - src[0]),
+                        mPad - (self[1] - src[1]));
+                c.clipRect(self[0] - src[0] - mPad,
+                        self[1] - src[1] - mPad,
+                        self[0] - src[0] - mPad + nw,
+                        self[1] - src[1] - mPad + nh);
+                page.draw(c);
+                c.restoreToCount(save);
+                drewAny = true;
             }
-            page.getLocationOnScreen(src);
-            int save = c.save();
-            c.translate(mPad - (self[0] - src[0]), mPad - (self[1] - src[1]));
-            c.clipRect(self[0] - src[0] - mPad, self[1] - src[1] - mPad,
-                    self[0] - src[0] - mPad + nw, self[1] - src[1] - mPad + nh);
-            page.draw(c);
-            c.restoreToCount(save);
+            if (!drewAny) {
+                pager.getLocationOnScreen(src);
+                int save = c.save();
+                c.translate(mPad - (self[0] - src[0]),
+                        mPad - (self[1] - src[1]));
+                pager.draw(c);
+                c.restoreToCount(save);
+            }
+        } finally {
+            mBackdropNode.endRecording();
         }
-        // The scaled tab layer: KernelSU's tabsBackdrop, drawn at
-        // lerp(1, 1.2, progress) so the icon under the droplet reads as
-        // enlarged once the lens bends it.
+        mBackdropNode.setRenderEffect(mBackdropEffect);
+    }
+
+    /**
+     * Builds the lens input from the already-blurred page, the glass surface,
+     * and a clear enlarged copy of the tabs.
+     */
+    private void paintBackdrop(Canvas c, int nw, int nh, int[] self,
+                               float p, float viewScale) {
+        ViewGroup tabRow = mTabRowRef.get();
+        int[] src = mSrc;
+        // Apply the scale compensation while compositing the effected node, not
+        // while recording its source. This keeps the 4dp blur at 4dp after the
+        // outer droplet scale is applied instead of enlarging the blur radius.
+        int pageSave = c.save();
+        if (Math.abs(viewScale - 1f) > 0.001f) {
+            c.scale(1f / viewScale, 1f / viewScale,
+                    nw * 0.5f, nh * 0.5f);
+        }
+        c.drawRenderNode(mBackdropNode);
+        c.restoreToCount(pageSave);
+
+        // The glass wash belongs to the growing droplet itself, so it is not
+        // inverse-scaled with the screen-space page and tabs.
+        float radius = (nh - mPad * 2) * 0.5f;
+        c.drawRoundRect(mPad, mPad, nw - mPad, nh - mPad,
+                radius, radius, mPillSurface);
+
+        // Preserve the exact resting material under the original pill. The new
+        // blurred page node supplies only the enlarged overflow around it.
         View pill = mPillRef.get();
         if (tabRow != null && ViewGeom.unscaledScreenPos(tabRow, src)) {
             int save = c.save();
+            if (Math.abs(viewScale - 1f) > 0.001f) {
+                c.scale(1f / viewScale, 1f / viewScale,
+                        nw * 0.5f, nh * 0.5f);
+            }
             c.translate(mPad - (self[0] - src[0]), mPad - (self[1] - src[1]));
-            // KernelSU's tabsBackdrop is a full glass pill carrying the tabs,
-            // not a bare icon layer (its onDrawSurface paints containerColor).
-            // Without it the page shows through wherever the tabs are
-            // transparent, and the droplet magnifies chat text.
-            if (pill != null && ViewGeom.unscaledScreenPos(pill, mTmp)) {
+            if (pill instanceof LiquidGlassPanel
+                    && ViewGeom.unscaledScreenPos(pill, mTmp)) {
                 int ps = c.save();
                 c.translate(mTmp[0] - src[0], mTmp[1] - src[1]);
-                float pr = pill.getHeight() * 0.5f;
-                c.drawRoundRect(0, 0, pill.getWidth(), pill.getHeight(),
-                        pr, pr, mPillSurface);
+                ((LiquidGlassPanel) pill).drawEmbedded(c);
                 c.restoreToCount(ps);
             }
+            c.restoreToCount(save);
+        }
+
+        // These tints belong to the surface, not to the icon/text. Keeping them
+        // below the tab copy removes the press-dark / release-light colour jump.
+        drawSurfaceTints(c, mPad, mPad, nw - mPad, nh - mPad, radius, p);
+
+        // The scaled tab layer: KernelSU's tabsBackdrop, drawn at
+        // lerp(1, 1.2, progress) so the icon under the droplet reads as
+        // enlarged once the lens bends it.
+        if (tabRow != null && ViewGeom.unscaledScreenPos(tabRow, src)) {
+            int save = c.save();
+            // Keep app content in fixed screen space while the droplet itself
+            // grows around it.
+            if (Math.abs(viewScale - 1f) > 0.001f) {
+                c.scale(1f / viewScale, 1f / viewScale,
+                        nw * 0.5f, nh * 0.5f);
+            }
+            c.translate(mPad - (self[0] - src[0]), mPad - (self[1] - src[1]));
             // Each tab scales about its OWN centre, exactly as KernelSU does
             // (graphicsLayer on each tab Column). Scaling the whole row about
             // one point instead shoves distant tabs outward and blows the
@@ -531,11 +675,11 @@ final class DropletPanel extends View {
         }
     }
 
-    private void drawLens(Canvas canvas, int w, int h, float radius, float p) {
+    private boolean drawLens(Canvas canvas, int w, int h, float radius, float p) {
         ViewGroup pager = mPagerRef.get();
         ViewGroup tabRow = mTabRowRef.get();
         if (pager == null) {
-            return;
+            return false;
         }
 
         int nw = w + mPad * 2;
@@ -548,12 +692,15 @@ final class DropletPanel extends View {
         // never scales, otherwise every sample lands somewhere else entirely.
         int[] self = mSelf;
         if (!ViewGeom.unscaledScreenPos(this, self)) {
-            return;
+            return false;
         }
+
+        float viewScale = ViewGeom.cumulativeScale(this);
+        recordBlurredBackdrop(nw, nh, self);
 
         RecordingCanvas rc = mNode.beginRecording(nw, nh);
         try {
-            paintBackdrop(rc, nw, nh, self, p);
+            paintBackdrop(rc, nw, nh, self, p, viewScale);
         } finally {
             mNode.endRecording();
         }
@@ -571,8 +718,18 @@ final class DropletPanel extends View {
         float half = contentHalfHeight(tabRow);
         if (half > 0f) {
             float scale = ViewGeom.cumulativeScale(this);
-            band = Math.max(0f,
-                    Math.min(band, h * 0.5f - half * (1f + TAB_ZOOM * p) / scale));
+            float contentSafe = Math.max(0f,
+                    h * 0.5f - half * (1f + TAB_ZOOM * p) / scale);
+            // Let a small part of the wider rim overlap the content bounds. The
+            // old strict clamp reduced WeChat back to roughly 14–15% and made the
+            // edge deformation look too thin even though the centre stayed clear.
+            float preferred = Math.min(band, h * REFRACTION_FRACTION);
+            band = Math.min(band, Math.max(contentSafe, preferred));
+        } else if (LiquidGlassModule.app() == HostApp.QQ) {
+            // QQ's first child is layout chrome rather than measurable content.
+            // Use the same slightly widened fraction as WeChat while keeping the
+            // full 10dp shader value as a hard upper bound.
+            band = Math.min(band, h * REFRACTION_FRACTION);
         }
         mLens.setFloatUniform("refractionHeight", band * p);
         mLens.setFloatUniform("refractionAmount", -band * (AMOUNT_DP / REFRACTION_DP) * p);
@@ -590,5 +747,6 @@ final class DropletPanel extends View {
         canvas.translate(-mPad, -mPad);
         canvas.drawRenderNode(mNode);
         canvas.restore();
+        return true;
     }
 }

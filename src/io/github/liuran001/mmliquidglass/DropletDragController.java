@@ -24,7 +24,7 @@ import java.lang.ref.WeakReference;
  * </pre>
  *
  * <p>Two details matter as much as the numbers. Position is tracked in
- * <em>tab units</em> (0..3) rather than pixels, so velocity normalises by the
+ * <em>tab units</em> (0..N-1) rather than pixels, so velocity normalises by the
  * tab count and feels identical on any screen. And release waits: the scale only
  * relaxes once the droplet has nearly arrived, which is what makes a flick read
  * as a single motion instead of a slide plus a separate shrink.
@@ -55,12 +55,10 @@ final class DropletDragController implements LiquidGlassHostLayout.DragHandler {
     private WeakReference<View> mPillRef = new WeakReference<>(null);
     private WeakReference<View> mHostRef = new WeakReference<>(null);
     private final WeakReference<View> mDropletRef;
-    private final WeakReference<ViewGroup> mTabRowRef;
+    private WeakReference<ViewGroup> mTabRowRef;
     private final int mTouchSlop;
     private final float mDensity;
     private final boolean mNight;
-    private final int mTabCount;
-
     private final Spring mValue;
     private final Spring mVelocity;
     private final Spring mPress;
@@ -103,7 +101,6 @@ final class DropletDragController implements LiquidGlassHostLayout.DragHandler {
         mTouchSlop = ViewConfiguration.get(droplet.getContext()).getScaledTouchSlop();
         mDensity = density;
         mNight = night;
-        mTabCount = Math.max(1, tabRow.getChildCount());
 
         float visibility = 0.001f;
         mValue = new Spring(1f, 1000f, visibility, 0f);
@@ -111,6 +108,29 @@ final class DropletDragController implements LiquidGlassHostLayout.DragHandler {
         mPress = new Spring(1f, 1000f, 0.001f, 0f);
         mScaleX = new Spring(0.6f, 250f, 0.001f, 1f);
         mScaleY = new Spring(0.7f, 250f, 0.001f, 1f);
+    }
+
+    /**
+     * Rebinds to the row the app currently owns.
+     *
+     * <p>QQ can add/remove tabs, or replace Material's SlidingTabIndicator,
+     * while the Activity stays alive. Cancelling any in-flight gesture keeps a
+     * half-finished spring from continuing against the old geometry; the
+     * selection watcher snaps to the current tab after the new row lays out.
+     */
+    void setTabRow(ViewGroup tabRow) {
+        mTabRowRef = new WeakReference<>(tabRow);
+        mDragging = false;
+        mReleasePending = false;
+        mLastSampleMs = 0L;
+        mLastFrameNs = 0L;
+        float max = tabCount(tabRow) - 1f;
+        mValue.snapTo(clamp(mValue.value(), 0f, max));
+        mVelocity.snapTo(0f);
+        mPress.snapTo(0f);
+        mScaleX.snapTo(1f);
+        mScaleY.snapTo(1f);
+        apply();
     }
 
     /* ---------------- external drive ---------------- */
@@ -124,7 +144,8 @@ final class DropletDragController implements LiquidGlassHostLayout.DragHandler {
         if (mDragging) {
             return;
         }
-        float target = clamp(index, 0f, mTabCount - 1f);
+        ViewGroup tabRow = mTabRowRef.get();
+        float target = clamp(index, 0f, tabCount(tabRow) - 1f);
         // Releasing a drag already aimed the spring here, and the resulting
         // performClick() bounces the selection straight back at us. Without this
         // the droplet pops a second time after it has settled — KernelSU avoids
@@ -198,12 +219,13 @@ final class DropletDragController implements LiquidGlassHostLayout.DragHandler {
         if (!mDragging || tabRow == null) {
             return false;
         }
+        int tabCount = tabCount(tabRow);
         switch (ev.getActionMasked()) {
             case MotionEvent.ACTION_MOVE: {
                 float tabWidth = tabWidth(tabRow);
                 if (tabWidth > 0f) {
                     float v = mDragStartValue + (ev.getX() - mDownX) / tabWidth;
-                    mValue.animateTo(clamp(v, 0f, mTabCount - 1f));
+                    mValue.animateTo(clamp(v, 0f, tabCount - 1f));
                     schedule();
                 }
                 return true;
@@ -213,7 +235,7 @@ final class DropletDragController implements LiquidGlassHostLayout.DragHandler {
                 // KernelSU's onDragStopped: settle to the nearest index, then let
                 // that index flow back through the selection as the single source
                 // of truth. We only report it; the watcher drives the spring.
-                int index = Math.round(clamp(mValue.target(), 0f, mTabCount - 1f));
+                int index = Math.round(clamp(mValue.target(), 0f, tabCount - 1f));
                 mValue.animateTo(index);
                 mVelocity.animateTo(0f);
                 mDragging = false;
@@ -264,7 +286,8 @@ final class DropletDragController implements LiquidGlassHostLayout.DragHandler {
         if (!mReleasePending || mDragging) {
             return;
         }
-        float threshold = Math.max((mTabCount - 1f) * SETTLE_FRACTION, 0.001f);
+        float threshold = Math.max((tabCount(mTabRowRef.get()) - 1f)
+                * SETTLE_FRACTION, 0.001f);
         if (Math.abs(mValue.value() - mValue.target()) > threshold) {
             return;
         }
@@ -328,7 +351,8 @@ final class DropletDragController implements LiquidGlassHostLayout.DragHandler {
             return;
         }
         float perSecond = (mValue.value() - mLastSampleValue) * 1000f / dtMs;
-        mVelocity.animateTo(perSecond / Math.max(1f, mTabCount - 1f));
+        mVelocity.animateTo(perSecond
+                / Math.max(1f, tabCount(mTabRowRef.get()) - 1f));
         mLastSampleMs = now;
         mLastSampleValue = mValue.value();
     }
@@ -338,7 +362,7 @@ final class DropletDragController implements LiquidGlassHostLayout.DragHandler {
     private void apply() {
         View droplet = mDropletRef.get();
         ViewGroup tabRow = mTabRowRef.get();
-        if (droplet == null || tabRow == null) {
+        if (droplet == null || tabRow == null || TabBarBridge.tabCount(tabRow) == 0) {
             return;
         }
         float tabWidth = tabWidth(tabRow);
@@ -348,7 +372,10 @@ final class DropletDragController implements LiquidGlassHostLayout.DragHandler {
         // Centre using the laid-out width, not getWidth(): the droplet is sized
         // through LayoutParams and getWidth() still reads 0 until the next layout
         // pass, which parked it half a tab off on the first frame after launch.
-        View first = tabRow.getChildAt(0);
+        View first = TabBarBridge.tabAt(tabRow, 0);
+        if (first == null) {
+            return;
+        }
         ViewGroup.LayoutParams lp = droplet.getLayoutParams();
         float dropletW = lp != null && lp.width > 0 ? lp.width : droplet.getWidth();
         float originX = tabRow.getLeft() + first.getLeft()
@@ -417,8 +444,15 @@ final class DropletDragController implements LiquidGlassHostLayout.DragHandler {
     }
 
     private static float tabWidth(ViewGroup tabRow) {
-        View first = tabRow.getChildAt(0);
+        if (tabRow == null || TabBarBridge.tabCount(tabRow) == 0) {
+            return 0f;
+        }
+        View first = TabBarBridge.tabAt(tabRow, 0);
         return first == null ? 0f : first.getWidth();
+    }
+
+    private static int tabCount(ViewGroup tabRow) {
+        return Math.max(1, TabBarBridge.tabCount(tabRow));
     }
 
     private static float clamp(float v, float lo, float hi) {

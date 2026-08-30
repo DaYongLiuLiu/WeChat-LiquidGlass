@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the WeChat Liquid Glass LSPosed module (libxposed api 102).
+# Build the Liquid Glass LSPosed module for WeChat and QQ (libxposed api 102).
 #
 # No Gradle/Android Studio: this drives javac + d8 + aapt2 + apksigner directly.
 # Run ./setup-tools.sh once to populate $TOOL_ROOT.
@@ -94,7 +94,7 @@ else
     fi
     SIGN_ARGS=(--ks "$KS" --ks-pass pass:android --key-pass pass:android)
 fi
-FINAL="$PROJ/WeChatLiquidGlass-v$VERSION.apk"
+FINAL="$PROJ/LiquidGlass-v$VERSION.apk"
 java -cp "$BT/lib/apksigner.jar" com.android.apksigner.ApkSignerTool sign \
     "${SIGN_ARGS[@]}" --out "$FINAL" "$OUT/aligned.apk"
 
